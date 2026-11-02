@@ -19,11 +19,11 @@ jobs:
 
       - name: Gradle Kur
         uses: gradle/actions/setup-gradle@v4
-        with:
-          cache-disabled: true
 
-      - name: APK Dosyasini Olustur
-        run: gradle clean assembleDebug
+      - name: Gradle Yetkisi Ver ve Derle
+        run: |
+          chmod +x ./gradlew
+          ./gradlew clean assembleDebug
 
       - name: Hazir APK Dosyasini Yukle
         uses: actions/upload-artifact@v4
