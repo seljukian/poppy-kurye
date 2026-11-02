@@ -20,7 +20,7 @@ jobs:
       - name: Gradle Kur
         uses: gradle/actions/setup-gradle@v3
         with:
-          cache-enabled: false
+          cache-disabled: true
 
       - name: Gradle Sarmalayiciyi Olustur ve Derle
         run: |
