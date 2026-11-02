@@ -6,13 +6,13 @@ android {
     namespace 'com.poppy.courier'
     compileSdk 34
 
-    defaultConfig {
-        applicationId "com.poppy.courier"
-        minSdk 24
-        targetSdk 34
-        versionCode 2
-        versionName "2.1"
-    }
+   defaultConfig {
+    applicationId "com.poppy.courier"
+    minSdk 24
+    targetSdk 34
+    versionCode 20      // Sayıyı direkt 20 yapın
+    versionName "2.0"   // İsmi 2.0 yapın
+}
 
     buildTypes {
         debug {
