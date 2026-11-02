@@ -19,12 +19,14 @@ jobs:
 
       - name: Gradle Kur
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: true
 
       - name: APK Dosyasini Olustur
-        run: gradle assembleDebug
+        run: gradle clean assembleDebug
 
       - name: Hazir APK Dosyasini Yukle
         uses: actions/upload-artifact@v4
         with:
-          name: Poppy-Kurye-APK
+          name: Poppy-Kurye-APK-v2
           path: app/build/outputs/apk/debug/app-debug.apk
