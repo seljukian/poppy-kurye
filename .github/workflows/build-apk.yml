@@ -18,7 +18,7 @@ jobs:
           java-version: '17'
 
       - name: Gradle Kur
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v3
 
       - name: Gradle Sarmalayiciyi Olustur ve Derle
         run: |
