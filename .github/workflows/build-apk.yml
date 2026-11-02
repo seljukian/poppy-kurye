@@ -22,14 +22,15 @@ jobs:
         with:
           cache-disabled: true
 
-      - name: Gradle Sarmalayiciyi Olustur ve Derle
+      - name: App Klasorunde Derle
         run: |
+          cd app
           gradle wrapper
           chmod +x ./gradlew
-          ./gradlew :app:assembleDebug
+          ./gradlew assembleDebug
 
       - name: Hazir APK Dosyasini Yukle
         uses: actions/upload-artifact@v4
         with:
-          name: Poppy-Kurye-APK-v3
+          name: Poppy-Kurye-APK-Final
           path: app/build/outputs/apk/debug/app-debug.apk
