@@ -26,7 +26,7 @@ jobs:
         run: |
           gradle wrapper
           chmod +x ./gradlew
-          ./gradlew clean :app:assembleDebug
+          ./gradlew :app:assembleDebug
 
       - name: Hazir APK Dosyasini Yukle
         uses: actions/upload-artifact@v4
