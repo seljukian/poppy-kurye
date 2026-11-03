@@ -11,8 +11,12 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioManager;
+import android.media.AudioTrack;
 import android.media.RingtoneManager;
 import android.net.Uri;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.PowerManager;
@@ -43,22 +47,27 @@ public class MainActivity extends Activity {
 
     private WebView webView;
     private PowerManager.WakeLock wakeLock;
+    private WifiManager.WifiLock wifiLock;
     private static boolean isMonitorRunning = false;
+    private static boolean isKeepAliveRunning = false;
     private static Set<String> knownOrderIds = new HashSet<>();
     private static boolean firstCheckDone = false;
     private static int currentCourierId = 0;
 
-    private static final String CHANNEL_ID = "poppy_courier_orders_v3";
+    private static final String CHANNEL_ID = "poppy_courier_orders_v4";
     private static final String APP_URL = "https://panel.poppyapartments.com/courier_api.php";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        System.setProperty("http.keepAlive", "false");
+
         SharedPreferences prefs = getSharedPreferences("poppy_prefs", MODE_PRIVATE);
         currentCourierId = prefs.getInt("courier_id", 0);
 
-        keepCpuAwake();
+        keepCpuAndWifiAwake();
+        startSilentAudioKeepAlive();
         createOrderNotificationChannel();
         requestAllRequiredPermissions();
         startCourierGpsService();
@@ -125,8 +134,49 @@ public class MainActivity extends Activity {
 
         webView.loadUrl(APP_URL + "?t=" + System.currentTimeMillis());
 
-        // WebView kapansa bile arka planda sunucuyu doğrudan kontrol eden Java motoru
+        // Her 2.5 saniyede bir gecikmesiz sipariş kontrolü yapan motor
         startNativeOrderMonitor(getApplicationContext());
+    }
+
+    // Android'in 2 dakikalık arka plan uyku modunu tamamen engelleyen sessiz sinyal
+    private void startSilentAudioKeepAlive() {
+        if (isKeepAliveRunning) return;
+        isKeepAliveRunning = true;
+
+        Thread audioThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    int sampleRate = 8000;
+                    int bufSize = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                    if (bufSize <= 0) bufSize = sampleRate;
+
+                    AudioTrack track = new AudioTrack(
+                            AudioManager.STREAM_MUSIC,
+                            sampleRate,
+                            AudioFormat.CHANNEL_OUT_MONO,
+                            AudioFormat.ENCODING_PCM_16BIT,
+                            bufSize,
+                            AudioTrack.MODE_STREAM
+                    );
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                        track.setVolume(0.0f);
+                    } else {
+                        track.setStereoVolume(0.0f, 0.0f);
+                    }
+                    track.play();
+
+                    byte[] silence = new byte[bufSize];
+                    while (true) {
+                        track.write(silence, 0, silence.length);
+                        Thread.sleep(1000);
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        });
+        audioThread.setDaemon(true);
+        audioThread.start();
     }
 
     private void startNativeOrderMonitor(final Context appContext) {
@@ -143,8 +193,10 @@ public class MainActivity extends Activity {
                         URL url = new URL(checkUrl);
                         conn = (HttpURLConnection) url.openConnection();
                         conn.setRequestMethod("GET");
-                        conn.setConnectTimeout(5000);
-                        conn.setReadTimeout(5000);
+                        conn.setRequestProperty("Connection", "close");
+                        conn.setRequestProperty("Cache-Control", "no-cache, no-store, must-revalidate");
+                        conn.setConnectTimeout(3000);
+                        conn.setReadTimeout(3000);
                         conn.setUseCaches(false);
 
                         if (conn.getResponseCode() == 200) {
@@ -202,17 +254,31 @@ public class MainActivity extends Activity {
                     }
 
                     try {
-                        Thread.sleep(4000);
+                        Thread.sleep(2500);
                     } catch (InterruptedException ignored) {
                     }
                 }
             }
         });
+        monitorThread.setPriority(Thread.MAX_PRIORITY);
         monitorThread.setDaemon(true);
         monitorThread.start();
     }
 
     private void triggerNativeNotification(Context context, String title, String message) {
+        // Bildirim geldiği an ekran kilitli olsa bile ekran ışığını 5 saniye yak
+        try {
+            PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                PowerManager.WakeLock screenWake = pm.newWakeLock(
+                        PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                        "PoppyCourier::OrderScreenWake"
+                );
+                screenWake.acquire(5000);
+            }
+        } catch (Exception ignored) {
+        }
+
         NotificationManager manager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
         if (manager == null) return;
 
@@ -239,15 +305,29 @@ public class MainActivity extends Activity {
                 .setAutoCancel(true)
                 .setContentIntent(pendingIntent);
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            builder.setCategory(Notification.CATEGORY_CALL);
+            builder.setVisibility(Notification.VISIBILITY_PUBLIC);
+        }
+
         manager.notify((int) System.currentTimeMillis(), builder.build());
     }
 
-    private void keepCpuAwake() {
+    private void keepCpuAndWifiAwake() {
         try {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
             if (pm != null) {
                 wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PoppyCourier::BackgroundWatchLock");
                 wakeLock.acquire();
+            }
+        } catch (Exception ignored) {
+        }
+
+        try {
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            if (wm != null) {
+                wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "PoppyCourier::WifiWatchLock");
+                wifiLock.acquire();
             }
         } catch (Exception ignored) {
         }
@@ -290,10 +370,10 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
                     CHANNEL_ID,
-                    "Kurye Acil Sipariş Bildirimleri",
+                    "Kurye Anlık Sipariş Bildirimleri",
                     NotificationManager.IMPORTANCE_HIGH
             );
-            channel.setDescription("Arka plan yeni paket uyarıları");
+            channel.setDescription("Gecikmesiz yeni paket uyarıları");
             channel.enableVibration(true);
             channel.setVibrationPattern(new long[]{0, 500, 200, 500});
 
@@ -340,8 +420,7 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void sendNotification(String title, String message) {
-            // Bildirimler artık doğrudan Java arka plan motoru tarafından anlık gönderiliyor.
-            // Uygulama açıldığında gecikmeli çift bildirim düşmemesi için burası devre dışı bırakıldı.
+            // Bildirimler Java arka plan motoru tarafından anlık gönderilir
         }
     }
 
