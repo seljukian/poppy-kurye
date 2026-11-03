@@ -8,14 +8,13 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.media.AudioAttributes;
 import android.media.RingtoneManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.view.View;
@@ -28,41 +27,45 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 public class MainActivity extends Activity {
 
     private WebView webView;
     private PowerManager.WakeLock wakeLock;
-    private Handler backgroundOrderHandler;
-    private Runnable backgroundOrderRunnable;
+    private static boolean isMonitorRunning = false;
+    private static Set<String> knownOrderIds = new HashSet<>();
+    private static boolean firstCheckDone = false;
+    private static int currentCourierId = 0;
 
-    private static final String CHANNEL_ID = "poppy_courier_orders";
-    // Kurye panelinin sunucudaki tam adresi:
+    private static final String CHANNEL_ID = "poppy_courier_orders_v3";
     private static final String APP_URL = "https://panel.poppyapartments.com/courier_api.php";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // 1. Ekran kapansa bile işlemcinin uyumamasını sağla (WakeLock)
+        SharedPreferences prefs = getSharedPreferences("poppy_prefs", MODE_PRIVATE);
+        currentCourierId = prefs.getInt("courier_id", 0);
+
         keepCpuAwake();
-
-        // 2. Bildirim Kanalını Oluştur (Android 8+ için sesli ve üstten açılır bildirim)
         createOrderNotificationChannel();
-
-        // 3. Bildirim, Konum ve Pil İzinlerini İste
         requestAllRequiredPermissions();
-
-        // 4. Arka Plan GPS Servisini Başlat
         startCourierGpsService();
 
-        // 5. WebView Kurulumu (Arka planda bile uyumayan özel mod)
         webView = new WebView(this) {
             @Override
             protected void onWindowVisibilityChanged(int visibility) {
-                // Uygulama alta alınsa veya ekran kilitlense bile sayfayı hep AÇIK (VISIBLE) göster
                 super.onWindowVisibilityChanged(View.VISIBLE);
             }
         };
@@ -73,11 +76,7 @@ public class MainActivity extends Activity {
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
         settings.setGeolocationEnabled(true);
-
-        // Sipariş seslerinin ekrana dokunmadan otomatik çalmasını sağlar
         settings.setMediaPlaybackRequiresUserGesture(false);
-
-        // OTOMATİK GÜNCELLEME: Önbelleği kapatır, her açılışta sunucudaki en güncel PHP kodunu çeker
         settings.setCacheMode(WebSettings.LOAD_NO_CACHE);
         webView.clearCache(true);
 
@@ -87,8 +86,9 @@ public class MainActivity extends Activity {
             cookieManager.setAcceptThirdPartyCookies(webView, true);
         }
 
-        // PHP tarafından Android bildirimlerini tetiklemek için JS Köprüsü
-        webView.addJavascriptInterface(new WebAppInterface(this), "AndroidBridge");
+        WebAppInterface bridge = new WebAppInterface(this);
+        webView.addJavascriptInterface(bridge, "AndroidBridge");
+        webView.addJavascriptInterface(bridge, "PoppyAndroid");
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
@@ -123,11 +123,123 @@ public class MainActivity extends Activity {
             }
         });
 
-        // Sunucudan her zaman en taze görünümü çekmek için zaman damgası ile yükle
         webView.loadUrl(APP_URL + "?t=" + System.currentTimeMillis());
 
-        // 6. Arka Planda Her 4 Saniyede Bir Siparişleri Zorla Kontrol Et
-        startBackgroundOrderChecker();
+        // WebView kapansa bile arka planda sunucuyu doğrudan kontrol eden Java motoru
+        startNativeOrderMonitor(getApplicationContext());
+    }
+
+    private void startNativeOrderMonitor(final Context appContext) {
+        if (isMonitorRunning) return;
+        isMonitorRunning = true;
+
+        Thread monitorThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (true) {
+                    HttpURLConnection conn = null;
+                    try {
+                        String checkUrl = APP_URL + "?action=get_orders&courier_id=" + currentCourierId + "&t=" + System.currentTimeMillis();
+                        URL url = new URL(checkUrl);
+                        conn = (HttpURLConnection) url.openConnection();
+                        conn.setRequestMethod("GET");
+                        conn.setConnectTimeout(5000);
+                        conn.setReadTimeout(5000);
+                        conn.setUseCaches(false);
+
+                        if (conn.getResponseCode() == 200) {
+                            BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"));
+                            StringBuilder sb = new StringBuilder();
+                            String line;
+                            while ((line = reader.readLine()) != null) {
+                                sb.append(line);
+                            }
+                            reader.close();
+
+                            JSONObject json = new JSONObject(sb.toString());
+                            if ("ok".equals(json.optString("status"))) {
+                                JSONArray orders = json.optJSONArray("orders");
+                                Set<String> currentIds = new HashSet<>();
+                                String newCustomer = "";
+                                String newAddress = "";
+                                boolean hasNew = false;
+
+                                if (orders != null) {
+                                    for (int i = 0; i < orders.length(); i++) {
+                                        JSONObject o = orders.getJSONObject(i);
+                                        String key = o.optString("order_table", "pos") + "_" + o.optInt("id", 0);
+                                        currentIds.add(key);
+
+                                        if (firstCheckDone && !knownOrderIds.contains(key)) {
+                                            hasNew = true;
+                                            newCustomer = o.optString("customer_name", "Yeni Sipariş");
+                                            newAddress = o.optString("customer_address", "Paketi kontrol edin");
+                                        }
+                                    }
+                                }
+
+                                if (hasNew) {
+                                    triggerNativeNotification(appContext, "Yeni Sipariş Geldi! 🛵", newCustomer + " - " + newAddress);
+                                    runOnUiThread(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            if (webView != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                                                webView.evaluateJavascript("if(typeof fetchOrders === 'function') { fetchOrders(); }", null);
+                                            }
+                                        }
+                                    });
+                                }
+
+                                knownOrderIds = currentIds;
+                                firstCheckDone = true;
+                            }
+                        }
+                    } catch (Exception ignored) {
+                    } finally {
+                        if (conn != null) {
+                            conn.disconnect();
+                        }
+                    }
+
+                    try {
+                        Thread.sleep(4000);
+                    } catch (InterruptedException ignored) {
+                    }
+                }
+            }
+        });
+        monitorThread.setDaemon(true);
+        monitorThread.start();
+    }
+
+    private void triggerNativeNotification(Context context, String title, String message) {
+        NotificationManager manager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager == null) return;
+
+        Intent intent = new Intent(context, MainActivity.class);
+        intent.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        PendingIntent pendingIntent = PendingIntent.getActivity(context, 0, intent, flags);
+
+        Notification.Builder builder;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            builder = new Notification.Builder(context, CHANNEL_ID);
+        } else {
+            builder = new Notification.Builder(context);
+            builder.setPriority(Notification.PRIORITY_HIGH);
+            builder.setDefaults(Notification.DEFAULT_ALL);
+        }
+
+        builder.setSmallIcon(android.R.drawable.ic_dialog_map)
+                .setContentTitle(title)
+                .setContentText(message)
+                .setAutoCancel(true)
+                .setContentIntent(pendingIntent);
+
+        manager.notify((int) System.currentTimeMillis(), builder.build());
     }
 
     private void keepCpuAwake() {
@@ -138,34 +250,6 @@ public class MainActivity extends Activity {
                 wakeLock.acquire();
             }
         } catch (Exception ignored) {
-        }
-    }
-
-    private void startBackgroundOrderChecker() {
-        backgroundOrderHandler = new Handler(Looper.getMainLooper());
-        backgroundOrderRunnable = new Runnable() {
-            @Override
-            public void run() {
-                if (webView != null) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-                        webView.evaluateJavascript("if(typeof fetchOrders === 'function') { fetchOrders(); }", null);
-                    } else {
-                        webView.loadUrl("javascript:if(typeof fetchOrders === 'function') { fetchOrders(); }");
-                    }
-                }
-                backgroundOrderHandler.postDelayed(this, 4000);
-            }
-        };
-        backgroundOrderHandler.postDelayed(backgroundOrderRunnable, 4000);
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-        // Uygulama alta alındığında WebView zamanlayıcılarının durmasını engelle
-        if (webView != null) {
-            webView.onResume();
-            webView.resumeTimers();
         }
     }
 
@@ -206,10 +290,10 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
                     CHANNEL_ID,
-                    "Kurye Sipariş Bildirimleri",
+                    "Kurye Acil Sipariş Bildirimleri",
                     NotificationManager.IMPORTANCE_HIGH
             );
-            channel.setDescription("Yeni paket ve sipariş uyarıları");
+            channel.setDescription("Arka plan yeni paket uyarıları");
             channel.enableVibration(true);
             channel.setVibrationPattern(new long[]{0, 500, 200, 500});
 
@@ -246,34 +330,18 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void setCourier(int id, String name) {
+            currentCourierId = id;
+            getSharedPreferences("poppy_prefs", MODE_PRIVATE)
+                    .edit()
+                    .putInt("courier_id", id)
+                    .apply();
+        }
+
+        @JavascriptInterface
         public void sendNotification(String title, String message) {
-            NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-            if (manager == null) return;
-
-            Intent intent = new Intent(MainActivity.this, MainActivity.class);
-            intent.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                flags |= PendingIntent.FLAG_IMMUTABLE;
-            }
-            PendingIntent pendingIntent = PendingIntent.getActivity(MainActivity.this, 0, intent, flags);
-
-            Notification.Builder builder;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                builder = new Notification.Builder(MainActivity.this, CHANNEL_ID);
-            } else {
-                builder = new Notification.Builder(MainActivity.this);
-                builder.setPriority(Notification.PRIORITY_HIGH);
-                builder.setDefaults(Notification.DEFAULT_ALL);
-            }
-
-            builder.setSmallIcon(android.R.drawable.ic_dialog_map)
-                    .setContentTitle(title)
-                    .setContentText(message)
-                    .setAutoCancel(true)
-                    .setContentIntent(pendingIntent);
-
-            manager.notify((int) System.currentTimeMillis(), builder.build());
+            // Bildirimler artık doğrudan Java arka plan motoru tarafından anlık gönderiliyor.
+            // Uygulama açıldığında gecikmeli çift bildirim düşmemesi için burası devre dışı bırakıldı.
         }
     }
 
