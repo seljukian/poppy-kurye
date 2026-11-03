@@ -14,8 +14,11 @@ import android.media.RingtoneManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
+import android.view.View;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
 import android.webkit.GeolocationPermissions;
@@ -31,6 +34,10 @@ import java.util.List;
 public class MainActivity extends Activity {
 
     private WebView webView;
+    private PowerManager.WakeLock wakeLock;
+    private Handler backgroundOrderHandler;
+    private Runnable backgroundOrderRunnable;
+
     private static final String CHANNEL_ID = "poppy_courier_orders";
     // Kurye panelinin sunucudaki tam adresi:
     private static final String APP_URL = "https://panel.poppyapartments.com/courier_api.php";
@@ -39,17 +46,26 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // 1. Bildirim Kanalını Oluştur (Android 8+ için sesli ve üstten açılır bildirim)
+        // 1. Ekran kapansa bile işlemcinin uyumamasını sağla (WakeLock)
+        keepCpuAwake();
+
+        // 2. Bildirim Kanalını Oluştur (Android 8+ için sesli ve üstten açılır bildirim)
         createOrderNotificationChannel();
 
-        // 2. Bildirim, Konum ve Pil İzinlerini İste
+        // 3. Bildirim, Konum ve Pil İzinlerini İste
         requestAllRequiredPermissions();
 
-        // 3. Arka Plan GPS Servisini Başlat
+        // 4. Arka Plan GPS Servisini Başlat
         startCourierGpsService();
 
-        // 4. WebView Kurulumu (Önbelleksiz / Otomatik Güncelleme Modu)
-        webView = new WebView(this);
+        // 5. WebView Kurulumu (Arka planda bile uyumayan özel mod)
+        webView = new WebView(this) {
+            @Override
+            protected void onWindowVisibilityChanged(int visibility) {
+                // Uygulama alta alınsa veya ekran kilitlense bile sayfayı hep AÇIK (VISIBLE) göster
+                super.onWindowVisibilityChanged(View.VISIBLE);
+            }
+        };
         setContentView(webView);
 
         WebSettings settings = webView.getSettings();
@@ -77,13 +93,11 @@ public class MainActivity extends Activity {
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                // Harita, Telefon Arama veya WhatsApp linklerini dış uygulamada aç
                 if (url.startsWith("tel:") || url.startsWith("whatsapp:") || url.startsWith("geo:") || url.contains("maps.google.com") || url.contains("google.com/maps")) {
                     Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
                     startActivity(intent);
                     return true;
                 }
-                // Eğer yeni bir APK güncelleme linkine tıklandıysa doğrudan indirip kur
                 if (url.endsWith(".apk")) {
                     Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
                     startActivity(intent);
@@ -93,7 +107,6 @@ public class MainActivity extends Activity {
             }
         });
 
-        // WebView içinden GPS izni istendiğinde otomatik onayla
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback callback) {
@@ -101,7 +114,6 @@ public class MainActivity extends Activity {
             }
         });
 
-        // APK İndirme Dinleyicisi (Tek tıkla yeni sürüm indirme)
         webView.setDownloadListener(new DownloadListener() {
             @Override
             public void onDownloadStart(String url, String userAgent, String contentDisposition, String mimetype, long contentLength) {
@@ -113,43 +125,82 @@ public class MainActivity extends Activity {
 
         // Sunucudan her zaman en taze görünümü çekmek için zaman damgası ile yükle
         webView.loadUrl(APP_URL + "?t=" + System.currentTimeMillis());
+
+        // 6. Arka Planda Her 4 Saniyede Bir Siparişleri Zorla Kontrol Et
+        startBackgroundOrderChecker();
+    }
+
+    private void keepCpuAwake() {
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PoppyCourier::BackgroundWatchLock");
+                wakeLock.acquire();
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void startBackgroundOrderChecker() {
+        backgroundOrderHandler = new Handler(Looper.getMainLooper());
+        backgroundOrderRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (webView != null) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                        webView.evaluateJavascript("if(typeof fetchOrders === 'function') { fetchOrders(); }", null);
+                    } else {
+                        webView.loadUrl("javascript:if(typeof fetchOrders === 'function') { fetchOrders(); }");
+                    }
+                }
+                backgroundOrderHandler.postDelayed(this, 4000);
+            }
+        };
+        backgroundOrderHandler.postDelayed(backgroundOrderRunnable, 4000);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // Uygulama alta alındığında WebView zamanlayıcılarının durmasını engelle
+        if (webView != null) {
+            webView.onResume();
+            webView.resumeTimers();
+        }
     }
 
     private void requestAllRequiredPermissions() {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-        List<String> permissionsNeeded = new ArrayList<>();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            List<String> permissionsNeeded = new ArrayList<>();
 
-        // 1. ÖNCELİK: Android 13+ (API 33+) Bildirim İznini En Başa Ekle
-        if (Build.VERSION.SDK_INT >= 33) {
-            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                permissionsNeeded.add(Manifest.permission.POST_NOTIFICATIONS);
+            if (Build.VERSION.SDK_INT >= 33) {
+                if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    permissionsNeeded.add(Manifest.permission.POST_NOTIFICATIONS);
+                }
             }
-        }
 
-        // 2. Ardından Konum İzinlerini Ekle
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            permissionsNeeded.add(Manifest.permission.ACCESS_FINE_LOCATION);
-        }
-        if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            permissionsNeeded.add(Manifest.permission.ACCESS_COARSE_LOCATION);
-        }
+            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                permissionsNeeded.add(Manifest.permission.ACCESS_FINE_LOCATION);
+            }
+            if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                permissionsNeeded.add(Manifest.permission.ACCESS_COARSE_LOCATION);
+            }
 
-        if (!permissionsNeeded.isEmpty()) {
-            requestPermissions(permissionsNeeded.toArray(new String[0]), 101);
-        }
+            if (!permissionsNeeded.isEmpty()) {
+                requestPermissions(permissionsNeeded.toArray(new String[0]), 101);
+            }
 
-        // Pil optimizasyonu muafiyeti
-        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-        if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
-            try {
-                Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
-                intent.setData(Uri.parse("package:" + getPackageName()));
-                startActivity(intent);
-            } catch (Exception ignored) {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                try {
+                    Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                    intent.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(intent);
+                } catch (Exception ignored) {
+                }
             }
         }
     }
-}
 
     private void createOrderNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -187,7 +238,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // PHP / JavaScript üzerinden üstten bildirim düşürmek için köprü
     public class WebAppInterface {
         Context mContext;
 
