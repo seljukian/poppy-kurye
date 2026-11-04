@@ -15,16 +15,16 @@ import android.content.pm.PackageManager;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
-import android.net.URL;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.IBinder;
 
 import java.net.HttpURLConnection;
+import java.net.URL;
 
 public class GpsTrackerService extends Service implements LocationListener {
     private static final String SERVER_API_URL = "https://panel.poppyapartments.com/courier_api.php";
-    private static final String GPS_CHANNEL_ID = "poppy_gps_silent_v3";
+    private static final String GPS_CHANNEL_ID = "poppy_gps_silent_v4";
 
     private LocationManager locationManager;
     private int courierId = 0;
@@ -32,7 +32,6 @@ public class GpsTrackerService extends Service implements LocationListener {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         try {
-            // Konum izni henüz verilmediyse servisi başlatıp uygulamayı çökertme
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 boolean fine = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
                 boolean coarse = checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
@@ -83,6 +82,10 @@ public class GpsTrackerService extends Service implements LocationListener {
                 builder.setPriority(Notification.PRIORITY_MIN);
             }
 
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                builder.setVisibility(Notification.VISIBILITY_SECRET);
+            }
+
             Intent openIntent = new Intent(this, MainActivity.class);
             int pFlags = PendingIntent.FLAG_UPDATE_CURRENT;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -92,7 +95,7 @@ public class GpsTrackerService extends Service implements LocationListener {
 
             Notification notification = builder
                     .setContentTitle("Poppy Kurye Aktif")
-                    .setContentText("Sipariş ve konum sistemi çalışıyor")
+                    .setContentText("Konum servisi çalışıyor")
                     .setSmallIcon(android.R.drawable.ic_menu_mylocation)
                     .setContentIntent(pendingIntent)
                     .build();
@@ -149,7 +152,6 @@ public class GpsTrackerService extends Service implements LocationListener {
         return null;
     }
 
-    // TELEFON AÇILDIĞINDA UYGULAMAYI OTOMATİK AÇAN BAŞLATICI
     public static class BootReceiver extends BroadcastReceiver {
         @Override
         public void onReceive(Context context, Intent intent) {
