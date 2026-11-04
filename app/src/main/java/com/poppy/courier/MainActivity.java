@@ -22,6 +22,7 @@ import android.os.Bundle;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.view.View;
+import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
 import android.webkit.GeolocationPermissions;
@@ -54,12 +55,23 @@ public class MainActivity extends Activity {
     private static boolean firstCheckDone = false;
     private static int currentCourierId = 0;
 
-    private static final String CHANNEL_ID = "poppy_courier_orders_v4";
+    private static final String CHANNEL_ID = "poppy_courier_orders_v5";
     private static final String APP_URL = "https://panel.poppyapartments.com/courier_api.php";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                setShowWhenLocked(true);
+                setTurnScreenOn(true);
+            } else {
+                getWindow().addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                        | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
+            }
+        } catch (Throwable ignored) {
+        }
 
         System.setProperty("http.keepAlive", "false");
 
@@ -70,7 +82,7 @@ public class MainActivity extends Activity {
         startSilentAudioKeepAlive();
         createOrderNotificationChannel();
         requestAllRequiredPermissions();
-        startCourierGpsService();
+        startCourierGpsServiceIfPermitted();
 
         webView = new WebView(this) {
             @Override
@@ -134,11 +146,34 @@ public class MainActivity extends Activity {
 
         webView.loadUrl(APP_URL + "?t=" + System.currentTimeMillis());
 
-        // Her 2.5 saniyede bir gecikmesiz sipariş kontrolü yapan motor
         startNativeOrderMonitor(getApplicationContext());
     }
 
-    // Android'in 2 dakikalık arka plan uyku modunu tamamen engelleyen sessiz sinyal
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        // Kullanıcı konum iznini onayladığı anda GPS servisini güvenli başlat
+        startCourierGpsServiceIfPermitted();
+    }
+
+    private void startCourierGpsServiceIfPermitted() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                boolean fine = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+                boolean coarse = checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+                if (!fine && !coarse) return;
+            }
+            Intent serviceIntent = new Intent(this, GpsTrackerService.class);
+            serviceIntent.putExtra("courier_id", currentCourierId);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent);
+            } else {
+                startService(serviceIntent);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     private void startSilentAudioKeepAlive() {
         if (isKeepAliveRunning) return;
         isKeepAliveRunning = true;
@@ -171,7 +206,7 @@ public class MainActivity extends Activity {
                         track.write(silence, 0, silence.length);
                         Thread.sleep(1000);
                     }
-                } catch (Exception ignored) {
+                } catch (Throwable ignored) {
                 }
             }
         });
@@ -246,7 +281,7 @@ public class MainActivity extends Activity {
                                 firstCheckDone = true;
                             }
                         }
-                    } catch (Exception ignored) {
+                    } catch (Throwable ignored) {
                     } finally {
                         if (conn != null) {
                             conn.disconnect();
@@ -266,7 +301,6 @@ public class MainActivity extends Activity {
     }
 
     private void triggerNativeNotification(Context context, String title, String message) {
-        // Bildirim geldiği an ekran kilitli olsa bile ekran ışığını 5 saniye yak
         try {
             PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
             if (pm != null) {
@@ -276,7 +310,7 @@ public class MainActivity extends Activity {
                 );
                 screenWake.acquire(5000);
             }
-        } catch (Exception ignored) {
+        } catch (Throwable ignored) {
         }
 
         NotificationManager manager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
@@ -320,7 +354,7 @@ public class MainActivity extends Activity {
                 wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PoppyCourier::BackgroundWatchLock");
                 wakeLock.acquire();
             }
-        } catch (Exception ignored) {
+        } catch (Throwable ignored) {
         }
 
         try {
@@ -329,7 +363,7 @@ public class MainActivity extends Activity {
                 wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "PoppyCourier::WifiWatchLock");
                 wifiLock.acquire();
             }
-        } catch (Exception ignored) {
+        } catch (Throwable ignored) {
         }
     }
 
@@ -354,14 +388,25 @@ public class MainActivity extends Activity {
                 requestPermissions(permissionsNeeded.toArray(new String[0]), 101);
             }
 
-            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
-                try {
+            // Pil optimizasyonu muafiyeti
+            try {
+                PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
                     Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
                     intent.setData(Uri.parse("package:" + getPackageName()));
                     startActivity(intent);
-                } catch (Exception ignored) {
                 }
+            } catch (Throwable ignored) {
+            }
+
+            // Telefon yeniden başladığında uygulamanın otomatik açılabilmesi için üstte gösterme izni
+            try {
+                if (!Settings.canDrawOverlays(this)) {
+                    Intent overlayIntent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:" + getPackageName()));
+                    startActivity(overlayIntent);
+                }
+            } catch (Throwable ignored) {
             }
         }
     }
@@ -390,18 +435,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void startCourierGpsService() {
-        try {
-            Intent serviceIntent = new Intent(this, GpsTrackerService.class);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(serviceIntent);
-            } else {
-                startService(serviceIntent);
-            }
-        } catch (Exception ignored) {
-        }
-    }
-
     public class WebAppInterface {
         Context mContext;
 
@@ -416,6 +449,7 @@ public class MainActivity extends Activity {
                     .edit()
                     .putInt("courier_id", id)
                     .apply();
+            startCourierGpsServiceIfPermitted();
         }
 
         @JavascriptInterface
