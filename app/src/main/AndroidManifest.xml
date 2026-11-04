@@ -20,7 +20,8 @@
     <application
         android:allowBackup="true"
         android:label="Poppy Kurye"
-        android:icon="@android:drawable/ic_dialog_map"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
